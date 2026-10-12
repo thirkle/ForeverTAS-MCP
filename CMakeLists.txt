@@ -193,6 +193,8 @@ add_library(forevertas_core STATIC
     src/evaluators/iteration_evaluator.h
     src/evaluators/custom_volume_entry_evaluator.cpp
     src/evaluators/custom_volume_entry_evaluator.h
+    src/evaluators/gate_entry_evaluator.cpp
+    src/evaluators/gate_entry_evaluator.h
     src/evaluators/evaluator_utils.h
     src/evaluators/precise_finish_time_evaluator.cpp
     src/evaluators/precise_finish_time_evaluator.h
@@ -570,6 +572,7 @@ qt_add_qml_module(forevertas_qml
         qml/settings/InputInsertionSettings.qml
         qml/settings/ModifierComposition.qml
         qml/settings/ModifierPassControls.qml
+        qml/settings/GateEntryEvaluationSettings.qml
         qml/settings/PointTargetEvaluationSettings.qml
         qml/settings/PoseTargetEvaluationSettings.qml
         qml/settings/RandomSteeringMutationSettings.qml

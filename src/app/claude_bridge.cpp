@@ -2,6 +2,7 @@
 
 #include "app/claude_tool_catalog.h"
 #include "app/search_controller.h"
+#include "evaluators/gate_entry_evaluator.h"
 #include "input_timeline_time.h"
 #include "mutations/input_event_formatter.h"
 #include "mutations/input_event_utils.h"
@@ -34,13 +35,17 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <cstdio>
+#include <deque>
 #include <exception>
 #include <limits>
+#include <map>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <thread>
 #include <utility>
 #include <vector>
 
@@ -53,7 +58,9 @@ namespace {
 
 constexpr std::uint32_t kTickMs = kInputTimelineTickDurationMs;
 constexpr std::uint32_t kDefaultSimulateHorizonMs = 600000u;
-constexpr int kMaximumCompareScripts = 64;
+constexpr int kMaximumCompareScripts = 256;
+constexpr int kMaximumSimulationThreads = 32;
+constexpr std::size_t kMaximumSnapshots = 64u;
 constexpr qsizetype kMaximumMessageBytes = 256 * 1024 * 1024;
 
 template<typename T, typename Error>
@@ -173,6 +180,17 @@ int ClampedInt(const QJsonValue &value, int fallback, int minimum, int maximum) 
 // Headless simulation (runs only on simulationPool_'s single thread).
 // --------------------------------------------------------------------------
 
+// A physics state captured part-way through a run, so later scripts that share
+// the same inputs up to that point can continue from it instead of from 0.
+struct ClaudeSimulationSnapshot {
+    fvx::PhysicsSandboxState state;
+    // Every input event at or before simTimeMs; a resumed script must match.
+    std::vector<fvx::PhysicsSandboxInputEvent> prefix;
+    std::int64_t simTimeMs = 0;
+    std::int64_t inputTimeMs = 0;
+    QJsonArray checkpointsBefore;
+};
+
 struct ClaudeSimulationCache {
     std::string packs;
     std::string scenario;
@@ -183,13 +201,55 @@ struct ClaudeSimulationCache {
     std::vector<fvx::PhysicsSandboxInputEvent> canonicalInputs;
     std::int64_t raceStartMs = 0;
     std::string mapName;
+    // Clones of `sandbox` for parallel batch simulation, each with its own
+    // captured initial state.
+    std::deque<fvx::PhysicsSandbox> workers;
+    std::vector<fvx::PhysicsSandboxState> workerInitialStates;
+    std::map<std::string, std::shared_ptr<const ClaudeSimulationSnapshot>> snapshots;
+    std::deque<std::string> snapshotOrder;
+    std::uint64_t nextSnapshot = 1u;
 
+    void ensureWorkers(std::size_t count) {
+        while (workers.size() < count) {
+            Require(sandbox->RestoreState(*initialState), "restoring initial state");
+            workers.push_back(Require(fvx::ClonePhysicsSandbox(*sandbox),
+                                      "cloning simulation worker"));
+            workerInitialStates.push_back(
+                    Require(workers.back().CaptureState(), "capturing worker state"));
+        }
+    }
+
+    std::string storeSnapshot(ClaudeSimulationSnapshot snapshot) {
+        const std::string id = "snap" + std::to_string(nextSnapshot++);
+        snapshots[id] = std::make_shared<const ClaudeSimulationSnapshot>(std::move(snapshot));
+        snapshotOrder.push_back(id);
+        while (snapshotOrder.size() > kMaximumSnapshots) {
+            snapshots.erase(snapshotOrder.front());
+            snapshotOrder.pop_front();
+        }
+        return id;
+    }
+
+    // The sandbox is built once per scenario with a horizon capacity of at
+    // least `requiredHorizonMs`; shorter requested horizons are applied as a
+    // stop time by the simulation loop, so changing horizon_ms between calls
+    // never rebuilds the map. Rebuilds happen only for a new scenario or a
+    // horizon beyond the capacity.
     void ensure(const std::string &packsDirectory,
                 const std::string &scenarioPath,
-                std::uint32_t simulationHorizonMs) {
-        if (sandbox && packs == packsDirectory && scenario == scenarioPath &&
-            horizonMs == simulationHorizonMs) {
-            return;
+                std::uint32_t requiredHorizonMs) {
+        const bool sameScenario = sandbox && packs == packsDirectory &&
+                scenario == scenarioPath;
+        if (sameScenario && requiredHorizonMs <= horizonMs) return;
+        const std::uint32_t simulationHorizonMs =
+                std::max(requiredHorizonMs, kDefaultSimulateHorizonMs);
+        workers.clear();
+        workerInitialStates.clear();
+        // Canonical-timeline states restore across horizons on the same
+        // scenario, so snapshots survive a capacity increase.
+        if (!sameScenario) {
+            snapshots.clear();
+            snapshotOrder.clear();
         }
         sandbox.reset();
         initialState.reset();
@@ -248,15 +308,59 @@ struct SimulationOptions {
     std::int64_t toMs = std::numeric_limits<std::int64_t>::max();
     QString csvPath;
     bool samples = true;
+    // Stop time (simulation clock); 0 = the cache capacity.
+    std::uint32_t horizonMs = 0u;
+    // Gates reported per run (independent first crossings) and scored in
+    // order exactly as the gate-entry search target would score them.
+    std::shared_ptr<const std::vector<GateSpec>> gates;
+    std::shared_ptr<const IterationEvaluator> gateEvaluator;
+    GateScoring gateScoring;
+    std::int64_t gateFromMs = 0;  // input clock
+    // Capture a snapshot when the run reaches this input-clock time.
+    std::optional<std::int64_t> snapshotAtMs;
+    // Continue from this snapshot instead of the start.
+    std::shared_ptr<const ClaudeSimulationSnapshot> fromSnapshot;
 };
 
 const char *const kSampleFields =
         "t_ms,x,y,z,speed_kmh,vx,vy,vz,fwd_speed,side_speed,yaw,pitch,roll,"
-        "steer,gas,brake,gear,rpm,wheels_on_ground,sliding,turbo,checkpoints";
+        "steer,gas,brake,gear,rpm,wheels_on_ground,sliding,turbo,checkpoints,"
+        "lateral_contact";
+
+bool SameEvent(const fvx::PhysicsSandboxInputEvent &left,
+               const fvx::PhysicsSandboxInputEvent &right) {
+    return left.timeMs == right.timeMs && left.action == right.action &&
+            left.value.kind == right.value.kind &&
+            left.value.switchState == right.value.switchState &&
+            left.value.analog == right.value.analog;
+}
+
+QJsonObject GateCrossingJson(const ClaudeSimulationCache &cache,
+                             const GateCrossing &crossing) {
+    QJsonObject entry{
+            {QStringLiteral("crossed"), true},
+            {QStringLiteral("valid"), crossing.valid},
+            {QStringLiteral("sim_ms"), Round(crossing.timeMs, 3)},
+            {QStringLiteral("t_ms"),
+             Round(crossing.timeMs - static_cast<double>(cache.raceStartMs + kTickMs), 3)},
+            {QStringLiteral("speed_kmh"), Round(crossing.speedKmh, 3)},
+            {QStringLiteral("yaw"), Round(crossing.yawDeg, 2)},
+            {QStringLiteral("lat"), Round(crossing.lateral, 3)},
+            {QStringLiteral("height"), Round(crossing.height, 3)},
+            {QStringLiteral("wheels"), crossing.wheels}};
+    if (!crossing.valid) {
+        entry.insert(QStringLiteral("penalty"), Round(crossing.penalty, 3));
+        entry.insert(QStringLiteral("violations"), Q(crossing.violations));
+    }
+    return entry;
+}
 
 QJsonObject SimulateScript(ClaudeSimulationCache &cache,
+                           fvx::PhysicsSandbox &sandbox,
+                           const fvx::PhysicsSandboxState &initialState,
                            const std::string &script,
-                           const SimulationOptions &options) {
+                           const SimulationOptions &options,
+                           std::optional<ClaudeSimulationSnapshot> *snapshotOut = nullptr) {
     const InputScriptParseResult parsed = ParseInputScript(script);
     if (!parsed) {
         return Error(QStringLiteral("Script parse error: %1").arg(Q(*parsed.error)));
@@ -267,11 +371,37 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
         return Error(QStringLiteral("Script error: %1").arg(Q(*baseline.error)));
     }
     ConvertKeyboardSteeringToAnalog(baseline.events);
+    const std::vector<fvx::PhysicsSandboxInputEvent> events = baseline.events;
 
-    fvx::PhysicsSandbox &sandbox = *cache.sandbox;
-    fvx::PhysicsSandboxStateView view = Require(
-            sandbox.RestoreState(*cache.initialState), "restoring initial state");
-    Require(sandbox.ReplaceInputs(std::move(baseline.events)), "applying inputs");
+    QJsonArray checkpoints;
+    fvx::PhysicsSandboxStateView view;
+    if (options.fromSnapshot) {
+        const ClaudeSimulationSnapshot &snapshot = *options.fromSnapshot;
+        std::size_t count = 0u;
+        for (const auto &event : events) {
+            if (event.timeMs > snapshot.simTimeMs) break;
+            if (count >= snapshot.prefix.size() || !SameEvent(event, snapshot.prefix[count])) {
+                return Error(QStringLiteral(
+                        "Script differs from the snapshot before its time (%1 ms on the "
+                        "script clock), first at %2 ms. Inputs at or before the snapshot "
+                        "time must be identical; take the snapshot earlier.")
+                                     .arg(snapshot.inputTimeMs)
+                                     .arg(cache.inputTime(static_cast<std::uint64_t>(
+                                             std::max(0, event.timeMs)))));
+            }
+            ++count;
+        }
+        if (count != snapshot.prefix.size()) {
+            return Error(QStringLiteral(
+                    "Script lacks inputs the snapshot had before its time (%1 ms)")
+                                 .arg(snapshot.inputTimeMs));
+        }
+        view = Require(sandbox.RestoreState(snapshot.state), "restoring snapshot");
+        checkpoints = snapshot.checkpointsBefore;
+    } else {
+        view = Require(sandbox.RestoreState(initialState), "restoring initial state");
+    }
+    Require(sandbox.ReplaceInputs(events), "applying inputs");
 
     std::unique_ptr<QFile> csv;
     std::unique_ptr<QTextStream> csvStream;
@@ -279,20 +409,34 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
         QDir().mkpath(QFileInfo(options.csvPath).absolutePath());
         csv = std::make_unique<QFile>(options.csvPath);
         if (!csv->open(QIODevice::WriteOnly | QIODevice::Truncate | QIODevice::Text)) {
-            return Error(QStringLiteral("Cannot write CSV %1").arg(options.csvPath));
+            return Error(QStringLiteral("Cannot write CSV %1: %2")
+                                 .arg(options.csvPath, csv->errorString()));
         }
         csvStream = std::make_unique<QTextStream>(csv.get());
         *csvStream << "sim_ms," << kSampleFields << ",respawns\n";
     }
 
+    const std::size_t gateCount = options.gates ? options.gates->size() : 0u;
+    std::vector<std::optional<GateCrossing>> firstCrossings(gateCount);
+    std::unique_ptr<IterationEvaluationSession> gateSession =
+            options.gateEvaluator ? options.gateEvaluator->CreateSession() : nullptr;
+    std::optional<EvaluationSample> gateBest;
+
+    std::optional<std::int64_t> snapshotSimMs;
+    if (options.snapshotAtMs) {
+        snapshotSimMs = SimulationTimelineTimeFromUserTime(
+                *options.snapshotAtMs, kTickMs, cache.raceStartMs);
+    }
+    QString snapshotError;
+
     QJsonArray samples;
-    QJsonArray checkpoints;
     double maxSpeed = 0.0;
     double maxSpeedAt = 0.0;
     std::uint64_t airborneTicks = 0u;
     std::uint64_t slidingTicks = 0u;
-    std::uint64_t ticks = 0u;
-    const std::uint64_t tickLimit = cache.horizonMs / kTickMs;
+    std::uint64_t lateralContactTicks = 0u;
+    const std::uint32_t horizonMs = options.horizonMs == 0u
+            ? cache.horizonMs : std::min(options.horizonMs, cache.horizonMs);
 
     const auto record = [&](const fvx::PhysicsSandboxStateView &state) {
         const auto &car = state.car;
@@ -308,6 +452,7 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
         if (state.tick > 0u) {
             if (onGround == 0) ++airborneTicks;
             if (sliding) ++slidingTicks;
+            if (car.lateralContact) ++lateralContactTicks;
         }
         for (const auto &event : state.acceptedCheckpointEvents) {
             checkpoints.append(QJsonObject{
@@ -339,7 +484,8 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
                 static_cast<double>(steer), Round(state.accelerate, 3), Round(state.brake, 3),
                 static_cast<double>(car.gear), Round(car.rpm, 1),
                 static_cast<double>(onGround), sliding ? 1.0 : 0.0,
-                Round(car.turbo, 3), static_cast<double>(state.checkpointsCollected)};
+                Round(car.turbo, 3), static_cast<double>(state.checkpointsCollected),
+                car.lateralContact ? 1.0 : 0.0};
         if (wantSample) {
             QJsonArray row;
             for (double value : values) row.append(value);
@@ -352,16 +498,53 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
         }
     };
 
+    const auto observeGates = [&](const fvx::PhysicsSandboxStateView &previous,
+                                  const fvx::PhysicsSandboxStateView &current) {
+        if (gateCount == 0u || cache.inputTime(current.timeMs) < options.gateFromMs) return;
+        for (std::size_t index = 0u; index < gateCount; ++index) {
+            if (firstCrossings[index]) continue;
+            firstCrossings[index] = TestGateCrossing((*options.gates)[index],
+                                                     options.gateScoring,
+                                                     previous, current);
+        }
+        if (gateSession && !gateSession->IsComplete()) {
+            if (auto sample = gateSession->Observe(previous, current)) {
+                if (!gateBest || options.gateEvaluator->IsBetter(*sample, *gateBest)) {
+                    gateBest = std::move(sample);
+                }
+            }
+        }
+    };
+
+    const auto captureSnapshot = [&](const fvx::PhysicsSandboxStateView &state) {
+        if (!snapshotOut || !snapshotSimMs ||
+            static_cast<std::int64_t>(state.timeMs) != *snapshotSimMs) {
+            return;
+        }
+        std::vector<fvx::PhysicsSandboxInputEvent> prefix;
+        for (const auto &event : events) {
+            if (event.timeMs > *snapshotSimMs) break;
+            prefix.push_back(event);
+        }
+        snapshotOut->emplace(ClaudeSimulationSnapshot{
+                Require(sandbox.CaptureState(), "capturing snapshot"),
+                std::move(prefix), *snapshotSimMs, *options.snapshotAtMs,
+                checkpoints});
+    };
+
     // A car that stays (almost) still for 10 s after the start will not
     // finish; stop there instead of simulating the whole horizon.
     constexpr std::uint64_t kStallTicks = 10000u / kTickMs;
     std::uint64_t stillTicks = 0u;
     bool stalled = false;
     record(view);
-    while (ticks < tickLimit && !view.raceCompleted) {
+    captureSnapshot(view);
+    while (static_cast<std::uint64_t>(view.timeMs) < horizonMs && !view.raceCompleted) {
+        const fvx::PhysicsSandboxStateView previous = view;
         view = Require(sandbox.AdvanceTicks(1u), "simulating");
-        ++ticks;
         record(view);
+        observeGates(previous, view);
+        captureSnapshot(view);
         const bool raceStarted = static_cast<std::int64_t>(view.timeMs) > cache.raceStartMs + 1000;
         stillTicks = raceStarted && Length(view.car.linearSpeed) < 0.5f ? stillTicks + 1u : 0u;
         if (stillTicks >= kStallTicks) {
@@ -370,6 +553,9 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
         }
     }
     if (csvStream) csvStream->flush();
+    if (snapshotOut && snapshotSimMs && !snapshotOut->has_value()) {
+        snapshotError = QStringLiteral("The run ended before the snapshot time");
+    }
 
     QJsonObject result{
             {QStringLiteral("finished"), view.raceCompleted},
@@ -382,7 +568,11 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
             {QStringLiteral("max_speed_at_ms"), maxSpeedAt},
             {QStringLiteral("airborne_ms"), static_cast<qint64>(airborneTicks * kTickMs)},
             {QStringLiteral("sliding_ms"), static_cast<qint64>(slidingTicks * kTickMs)},
+            {QStringLiteral("lateral_contact_ms"), static_cast<qint64>(lateralContactTicks * kTickMs)},
             {QStringLiteral("checkpoint_times"), checkpoints}};
+    if (options.fromSnapshot) {
+        result.insert(QStringLiteral("resumed_from_ms"), static_cast<qint64>(options.fromSnapshot->inputTimeMs));
+    }
     if (view.finishTimeMs) {
         result.insert(QStringLiteral("finish_time_ms"), static_cast<qint64>(*view.finishTimeMs));
     }
@@ -398,12 +588,80 @@ QJsonObject SimulateScript(ClaudeSimulationCache &cache,
         result.insert(QStringLiteral("end_position"), Vec(view.car.position));
         result.insert(QStringLiteral("end_speed_kmh"), Round(Length(view.car.linearSpeed) * 3.6, 2));
     }
+    if (gateCount > 0u) {
+        QJsonArray gateReports;
+        for (std::size_t index = 0u; index < gateCount; ++index) {
+            QJsonObject entry = firstCrossings[index]
+                    ? GateCrossingJson(cache, *firstCrossings[index])
+                    : QJsonObject{{QStringLiteral("crossed"), false}};
+            entry.insert(QStringLiteral("gate"), static_cast<qint64>(index));
+            gateReports.append(entry);
+        }
+        result.insert(QStringLiteral("gates"), gateReports);
+        if (gateBest) {
+            const bool valid = gateBest->score < kGateMissScoreBase;
+            result.insert(QStringLiteral("gate_target"),
+                          QJsonObject{{QStringLiteral("valid"), valid},
+                                      {QStringLiteral("score"), Round(gateBest->score, 4)},
+                                      {QStringLiteral("sim_ms"), Round(gateBest->timeMs, 3)},
+                                      {QStringLiteral("t_ms"),
+                                       Round(gateBest->timeMs -
+                                                     static_cast<double>(cache.raceStartMs + kTickMs), 3)},
+                                      {QStringLiteral("description"), Q(gateBest->description)}});
+        }
+    }
+    if (!snapshotError.isEmpty()) result.insert(QStringLiteral("snapshot_error"), snapshotError);
     if (options.samples && options.sampleIntervalMs > 0) {
         result.insert(QStringLiteral("sample_fields"), QString::fromLatin1(kSampleFields));
         result.insert(QStringLiteral("samples"), samples);
     }
     if (csv) result.insert(QStringLiteral("csv_path"), QDir::toNativeSeparators(options.csvPath));
     return result;
+}
+
+QJsonObject SimulateScript(ClaudeSimulationCache &cache,
+                           const std::string &script,
+                           const SimulationOptions &options) {
+    return SimulateScript(cache, *cache.sandbox, *cache.initialState, script, options);
+}
+
+// Runs `scripts` on up to `threads` cloned sandboxes in parallel. Results keep
+// the input order.
+QJsonArray SimulateBatch(ClaudeSimulationCache &cache,
+                         const std::vector<std::string> &scripts,
+                         const SimulationOptions &options,
+                         int threads) {
+    const std::size_t workerCount = static_cast<std::size_t>(std::clamp(
+            threads, 1, static_cast<int>(std::min<std::size_t>(scripts.size(), kMaximumSimulationThreads))));
+    cache.ensureWorkers(workerCount);
+    std::vector<QJsonObject> results(scripts.size());
+    std::atomic<std::size_t> next{0u};
+    const auto work = [&](std::size_t worker) {
+        for (;;) {
+            const std::size_t index = next.fetch_add(1u);
+            if (index >= scripts.size()) return;
+            try {
+                results[index] = SimulateScript(cache, cache.workers[worker],
+                                                cache.workerInitialStates[worker],
+                                                scripts[index], options);
+            } catch (const std::exception &error) {
+                results[index] = Error(QString::fromUtf8(error.what()));
+            }
+        }
+    };
+    std::vector<std::thread> pool;
+    for (std::size_t worker = 1u; worker < workerCount; ++worker) {
+        pool.emplace_back(work, worker);
+    }
+    work(0u);
+    for (auto &thread : pool) thread.join();
+    QJsonArray array;
+    for (std::size_t index = 0u; index < results.size(); ++index) {
+        QJsonObject entry = results[index];
+        entry.insert(QStringLiteral("index"), static_cast<qint64>(index));
+        array.append(entry);
+    }
+    return array;
 }
 
 QJsonObject ScenarioInfo(const ClaudeSimulationCache &cache) {
@@ -897,7 +1155,8 @@ void ClaudeBridge::toolGetDocumentation(const QJsonObject &arguments, Reply repl
             {QStringLiteral("checkpoint_time"), QStringLiteral("CHECKPOINT_TIME.md")},
             {QStringLiteral("input_insertion"), QStringLiteral("INPUT_INSERTION.md")},
             {QStringLiteral("gpu_backends"), QStringLiteral("GPU_BACKENDS.md")},
-            {QStringLiteral("gpu_safety"), QStringLiteral("GPU_SAFETY.md")}};
+            {QStringLiteral("gpu_safety"), QStringLiteral("GPU_SAFETY.md")},
+            {QStringLiteral("gates"), QStringLiteral("GATES.md")}};
     const QString topic = arguments.value(QStringLiteral("topic")).toString();
     const auto file = files.constFind(topic);
     if (file == files.constEnd()) {
@@ -1042,13 +1301,73 @@ void ClaudeBridge::toolUseBestAsBase(const QJsonObject &arguments, Reply reply) 
           false);
 }
 
+namespace {
+
+// Accepts gates as the compact target string, one object, or an array of
+// objects/strings ({"x":..,"y":..,"z":..,"dir":..,"hw":..,...}) and returns
+// the compact "k=v,...|k=v,..." form used by the gate-entry target.
+std::optional<QString> GateListText(const QJsonValue &value, QString *error) {
+    static const char *const keys[] = {"x", "y", "z", "dir", "hw", "lmin", "lmax",
+                                       "ymin", "ymax", "vmin", "vmax", "yawmin",
+                                       "yawmax", "wheels"};
+    const auto one = [&](const QJsonValue &gate) -> std::optional<QString> {
+        if (gate.isString()) return gate.toString();
+        if (!gate.isObject()) {
+            *error = QStringLiteral("each gate must be an object or a 'k=v,...' string");
+            return std::nullopt;
+        }
+        const QJsonObject object = gate.toObject();
+        for (auto it = object.begin(); it != object.end(); ++it) {
+            if (std::find_if(std::begin(keys), std::end(keys), [&](const char *key) {
+                    return it.key() == QLatin1String(key);
+                }) == std::end(keys)) {
+                *error = QStringLiteral("unknown gate field '%1'").arg(it.key());
+                return std::nullopt;
+            }
+        }
+        QStringList fields;
+        for (const char *key : keys) {
+            const QJsonValue field = object.value(QLatin1String(key));
+            if (field.isUndefined() || field.isNull()) continue;
+            if (!field.isDouble()) {
+                *error = QStringLiteral("gate field '%1' must be a number").arg(QLatin1String(key));
+                return std::nullopt;
+            }
+            fields.append(QStringLiteral("%1=%2").arg(QLatin1String(key))
+                                  .arg(QString::number(field.toDouble(), 'g', 12)));
+        }
+        return fields.join(',');
+    };
+    if (value.isString()) return value.toString();
+    if (value.isObject()) return one(value);
+    if (!value.isArray()) {
+        *error = QStringLiteral("'gates' must be an array of gate objects or a string");
+        return std::nullopt;
+    }
+    QStringList gates;
+    for (const QJsonValue &gate : value.toArray()) {
+        const auto text = one(gate);
+        if (!text) return std::nullopt;
+        gates.append(*text);
+    }
+    return gates.join('|');
+}
+
+int DefaultSimulationThreads() {
+    const unsigned hardware = std::thread::hardware_concurrency();
+    return std::clamp(hardware > 1u ? static_cast<int>(hardware) - 1 : 1, 1,
+                      kMaximumSimulationThreads);
+}
+
+}  // namespace
+
 void ClaudeBridge::toolSimulate(const QJsonObject &arguments, Reply reply) {
     std::vector<std::string> scripts;
     const bool compare = arguments.value(QStringLiteral("scripts")).isArray();
     if (compare) {
         const QJsonArray list = arguments.value(QStringLiteral("scripts")).toArray();
         if (list.isEmpty() || list.size() > kMaximumCompareScripts) {
-            reply(Error(QStringLiteral("'scripts' must hold 1..64 scripts")), true);
+            reply(Error(QStringLiteral("'scripts' must hold 1..%1 scripts").arg(kMaximumCompareScripts)), true);
             return;
         }
         for (const QJsonValue &value : list) scripts.push_back(S(value.toString()));
@@ -1072,6 +1391,7 @@ void ClaudeBridge::toolSimulate(const QJsonObject &arguments, Reply reply) {
         horizon = static_cast<std::uint32_t>(requested) / kTickMs * kTickMs;
     }
     SimulationOptions options;
+    options.horizonMs = horizon;
     options.sampleIntervalMs = ClampedInt(arguments.value(QStringLiteral("sample_interval_ms")), 250, 0, 3600000);
     if (options.sampleIntervalMs % static_cast<int>(kTickMs) != 0) {
         reply(Error(QStringLiteral("sample_interval_ms must be a multiple of 10")), true);
@@ -1083,20 +1403,91 @@ void ClaudeBridge::toolSimulate(const QJsonObject &arguments, Reply reply) {
             : std::numeric_limits<std::int64_t>::max();
     QString csv = arguments.value(QStringLiteral("csv_path")).toString();
     if (csv == QLatin1String("auto")) csv = DefaultOutputPath(QStringLiteral("sim-"), QStringLiteral(".csv"));
-    options.csvPath = compare ? QString() : QDir::fromNativeSeparators(csv);
-    options.samples = !compare;
+    options.csvPath = compare ? QString() : QDir::fromNativeSeparators(csv.trimmed());
+    options.samples = !compare || arguments.value(QStringLiteral("include_samples")).toBool();
+
+    if (arguments.contains(QStringLiteral("gates"))) {
+        QString error;
+        const auto text = GateListText(arguments.value(QStringLiteral("gates")), &error);
+        if (!text) {
+            reply(Error(error), true);
+            return;
+        }
+        std::string parseError;
+        auto gates = ParseGateList(S(*text), &parseError);
+        if (!gates) {
+            reply(Error(QStringLiteral("gates: %1").arg(Q(parseError))), true);
+            return;
+        }
+        OptionSettings settings = DefaultGateEntryOptionSettings();
+        settings["gates"] = S(*text);
+        settings["soft"] = arguments.value(QStringLiteral("gate_soft")).toBool(true) ? "true" : "false";
+        if (arguments.value(QStringLiteral("yaw_weight")).isDouble()) {
+            options.gateScoring.yawWeight = arguments.value(QStringLiteral("yaw_weight")).toDouble();
+            settings["yawWeight"] = S(SettingString(arguments.value(QStringLiteral("yaw_weight"))));
+        }
+        if (arguments.value(QStringLiteral("speed_weight")).isDouble()) {
+            options.gateScoring.speedWeight = arguments.value(QStringLiteral("speed_weight")).toDouble();
+            settings["speedWeight"] = S(SettingString(arguments.value(QStringLiteral("speed_weight"))));
+        }
+        try {
+            options.gateEvaluator = std::shared_ptr<const IterationEvaluator>(
+                    CreateGateEntryEvaluator(settings, kTickMs));
+        } catch (const std::exception &failure) {
+            reply(Error(QStringLiteral("gates: %1").arg(QString::fromUtf8(failure.what()))), true);
+            return;
+        }
+        options.gates = std::make_shared<const std::vector<GateSpec>>(std::move(*gates));
+        options.gateFromMs = ClampedInt(arguments.value(QStringLiteral("gate_from_ms")), 0, 0,
+                                        std::numeric_limits<int>::max());
+    }
+    if (arguments.value(QStringLiteral("snapshot_at_ms")).isDouble()) {
+        if (compare) {
+            reply(Error(QStringLiteral("snapshot_at_ms works with a single 'script'")), true);
+            return;
+        }
+        const qint64 at = static_cast<qint64>(arguments.value(QStringLiteral("snapshot_at_ms")).toDouble());
+        if (at < 0 || at % kTickMs != 0) {
+            reply(Error(QStringLiteral("snapshot_at_ms must be a non-negative multiple of 10")), true);
+            return;
+        }
+        options.snapshotAtMs = at;
+    }
+    const std::string fromSnapshot = S(arguments.value(QStringLiteral("from_snapshot")).toString());
+    const int threads = ClampedInt(arguments.value(QStringLiteral("threads")), DefaultSimulationThreads(),
+                                   1, kMaximumSimulationThreads);
     runSimulationJob(
-            [packsDirectory, scenario, horizon, scripts = std::move(scripts), options, compare](
-                    ClaudeSimulationCache &cache) {
+            [packsDirectory, scenario, horizon, scripts = std::move(scripts), options, compare,
+             fromSnapshot, threads](ClaudeSimulationCache &cache) mutable {
                 cache.ensure(packsDirectory, scenario, horizon);
-                if (!compare) return SimulateScript(cache, scripts.front(), options);
-                QJsonArray results;
-                for (std::size_t index = 0; index < scripts.size(); ++index) {
-                    QJsonObject entry = SimulateScript(cache, scripts[index], options);
-                    entry.insert(QStringLiteral("index"), static_cast<qint64>(index));
-                    results.append(entry);
+                if (!fromSnapshot.empty()) {
+                    const auto found = cache.snapshots.find(fromSnapshot);
+                    if (found == cache.snapshots.end()) {
+                        return Error(QStringLiteral("Unknown snapshot '%1' (snapshots are dropped when "
+                                                    "another scenario loads; at most %2 are kept)")
+                                             .arg(Q(fromSnapshot))
+                                             .arg(kMaximumSnapshots));
+                    }
+                    options.fromSnapshot = found->second;
                 }
-                return QJsonObject{{QStringLiteral("results"), results}};
+                if (!compare) {
+                    std::optional<ClaudeSimulationSnapshot> snapshot;
+                    QJsonObject result = SimulateScript(
+                            cache, *cache.sandbox, *cache.initialState, scripts.front(), options,
+                            options.snapshotAtMs ? &snapshot : nullptr);
+                    if (snapshot) {
+                        const qint64 at = snapshot->inputTimeMs;
+                        result.insert(QStringLiteral("snapshot_id"), Q(cache.storeSnapshot(std::move(*snapshot))));
+                        result.insert(QStringLiteral("snapshot_at_ms"), at);
+                    }
+                    return result;
+                }
+                QJsonObject result{{QStringLiteral("results"),
+                                    SimulateBatch(cache, scripts, options, threads)}};
+                result.insert(QStringLiteral("threads"),
+                              static_cast<qint64>(std::min<std::size_t>(scripts.size(),
+                                                                        static_cast<std::size_t>(threads))));
+                return result;
             },
             reply);
 }
@@ -1157,7 +1548,19 @@ void ClaudeBridge::toolConfigureSearch(const QJsonObject &arguments, Reply reply
             controller_.setEvaluationTargetId(id);
             if (!FindEvaluationTarget(S(id))) note(QStringLiteral("unknown target '%1'").arg(id));
         }
-        applySettings(target.value(QStringLiteral("settings")).toObject(),
+        QJsonObject targetSettings = target.value(QStringLiteral("settings")).toObject();
+        if (targetSettings.contains(QStringLiteral("gates")) &&
+            !targetSettings.value(QStringLiteral("gates")).isString()) {
+            QString error;
+            const auto text = GateListText(targetSettings.value(QStringLiteral("gates")), &error);
+            if (text) {
+                targetSettings.insert(QStringLiteral("gates"), *text);
+            } else {
+                note(QStringLiteral("target: gates rejected (%1)").arg(error));
+                targetSettings.remove(QStringLiteral("gates"));
+            }
+        }
+        applySettings(targetSettings,
                       [this](const QString &k, const QString &v) { controller_.setEvaluationTargetSetting(k, v); },
                       [this] { return controller_.evaluationTargetSettings(); },
                       QStringLiteral("target"));

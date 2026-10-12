@@ -27,9 +27,9 @@ R"json({
 })json",
 R"json({
  "name": "get_documentation",
- "description": "Returns ForeverTAS reference documentation bundled with the application. Topics: readme, search_components, conditions, checkpoint_time, input_insertion, gpu_backends, gpu_safety. Use 'conditions' before writing condition scripts or custom (scripted) targets.",
+ "description": "Returns ForeverTAS reference documentation bundled with the application. Topics: readme, search_components, conditions, gates, checkpoint_time, input_insertion, gpu_backends, gpu_safety. Use 'gates' before using the gate-entry target or simulate's gates; use 'conditions' before writing condition scripts or custom (scripted) targets.",
  "inputSchema": {"type": "object", "properties": {
-   "topic": {"type": "string", "enum": ["readme", "search_components", "conditions", "checkpoint_time", "input_insertion", "gpu_backends", "gpu_safety"]}
+   "topic": {"type": "string", "enum": ["readme", "search_components", "conditions", "gates", "checkpoint_time", "input_insertion", "gpu_backends", "gpu_safety"]}
  }, "required": ["topic"]}
 })json",
 R"json({
@@ -71,11 +71,20 @@ R"json({
 })json",
 R"json({
  "name": "simulate",
- "description": "Deterministically simulates input scripts on the optimized CPU engine (independent of the GUI, does not change application state) and reports the outcome: finish time (incl. sub-tick precise estimate), checkpoint times, respawns, max speed, airborne time, and sampled telemetry (position, velocity, km/h, yaw/pitch/roll, steer/gas/brake, gear, rpm, wheel contact, sliding, turbo). Checkpoint entries give 'number' (1-based, = checkpoint-time target's checkpointIndex), 'race_time_ms' (the game's tick time) and 't_ms' (input timeline). Telemetry t_ms is on the input-script clock. Give 'script' for one run with telemetry, or 'scripts' to compare several candidates by summary only. A full per-tick CSV can be written for detailed analysis.",
+ "description": "Deterministically simulates input scripts on the optimized CPU engine (independent of the GUI, does not change application state) and reports the outcome: finish time (incl. sub-tick precise estimate), checkpoint times, respawns, max speed, airborne/sliding/wall-contact time, and sampled telemetry (position, velocity, km/h, yaw/pitch/roll, steer/gas/brake, gear, rpm, wheel contact, sliding, turbo, lateral_contact). Checkpoint entries give 'number' (1-based, = checkpoint-time target's checkpointIndex), 'race_time_ms' (the game's tick time) and 't_ms' (input timeline). Telemetry t_ms is on the input-script clock. Give 'script' for one run with telemetry, or 'scripts' (up to 256) to run a batch in parallel on cloned simulators. 'gates' reports honest gate crossings per run and the score the gate-entry target would give (see get_documentation gates), so a batch can be ranked without pulling telemetry. Snapshots: 'snapshot_at_ms' captures the physics state at that time of a single run and returns a snapshot_id; 'from_snapshot' continues any later script (or batch) from it, provided its inputs at or before that time are identical, so a controller or sweep only re-simulates the part that changes. Changing horizon_ms never reloads the map. A full per-tick CSV can be written for detailed analysis.",
  "inputSchema": {"type": "object", "properties": {
    "script": {"type": "string", "description": "Input script to simulate. Defaults to the current base input script."},
-   "scripts": {"type": "array", "items": {"type": "string"}, "description": "Several scripts to compare (summaries only, max 64)."},
-   "horizon_ms": {"type": "integer", "description": "Stop after this much simulation time if the race has not finished. Default: the configured search end, or 600000 when unset."},
+   "scripts": {"type": "array", "items": {"type": "string"}, "description": "Batch of scripts run in parallel (max 256). Summaries only unless include_samples is true."},
+   "threads": {"type": "integer", "description": "Parallel simulators for 'scripts' (1-32). Default: CPU threads - 1."},
+   "include_samples": {"type": "boolean", "description": "Also return telemetry samples for every script of a batch. Default false."},
+   "gates": {"description": "Gates to evaluate on every run: an array of {x,y,z,dir[,hw|lmin,lmax][,ymin,ymax][,vmin,vmax][,yawmin,yawmax][,wheels]} objects or the compact 'x=..,y=..,z=..,dir=..|...' string. Last gate scored, earlier gates are ordered waypoints."},
+   "gate_from_ms": {"type": "integer", "description": "Ignore gate crossings before this script-clock time (mirror the search's earliest modifier time). Default 0."},
+   "gate_soft": {"type": "boolean", "description": "Soft (graded) gate scoring for gate_target. Default true."},
+   "yaw_weight": {"type": "number", "description": "Soft-score penalty metres per degree outside a gate's heading window. Default 0.5."},
+   "speed_weight": {"type": "number", "description": "Soft-score penalty metres per km/h outside a gate's speed window. Default 0.5."},
+   "snapshot_at_ms": {"type": "integer", "description": "Single script only: capture the state at this script-clock time (multiple of 10) and return snapshot_id. Up to 64 snapshots are kept per scenario."},
+   "from_snapshot": {"type": "string", "description": "snapshot_id to continue from. Inputs at or before the snapshot time must equal those of the run that took it; checkpoint_times include the earlier ones."},
+   "horizon_ms": {"type": "integer", "description": "Stop after this much simulation time if the race has not finished. Default 600000."},
    "sample_interval_ms": {"type": "integer", "description": "Telemetry sampling period (multiple of 10). Default 250. Use 0 to omit samples."},
    "from_ms": {"type": "integer", "description": "First sampled input-timeline time. Default 0."},
    "to_ms": {"type": "integer", "description": "Last sampled input-timeline time. Default: end of run."},
@@ -93,7 +102,7 @@ R"json({
    "condition_script": {"type": "string", "description": "Conditions filtering which ticks are eligible for evaluation, one ANDed comparison per line (see get_documentation conditions). Empty string clears."},
    "algorithm": {"type": "object", "properties": {"id": {"type": "string"}, "settings": {"type": "object"}}},
    "modifiers": {"type": "array", "items": {"type": "object", "properties": {"id": {"type": "string"}, "enabled": {"type": "boolean"}, "settings": {"type": "object"}}, "required": ["id"]}},
-   "target": {"type": "object", "properties": {"id": {"type": "string"}, "settings": {"type": "object"}}},
+   "target": {"type": "object", "description": "Evaluation target. 'gate-entry' scores the honest, interpolated crossing of the last of an ordered list of gates (earlier gates are waypoints with their own limits) and, with soft=true, ranks candidates that miss by how close they came, so a search progresses even when nothing reaches the gate yet; its 'gates' setting accepts an array of gate objects (see get_documentation gates).", "properties": {"id": {"type": "string"}, "settings": {"type": "object"}}},
    "cpu_workers": {"type": "integer"},
    "gpu_batch_size": {"type": "integer", "description": "Parallel samples per GPU batch (CUDA/Vulkan/HIP)."},
    "gpu_calibration": {"type": "boolean", "description": "Let the GPU backend calibrate its batch size."},
@@ -195,6 +204,11 @@ QString ClaudeServerInstructions() {
             "precise-finish-time or checkpoint-time, modifier windows around "
             "the section being optimised) -> start_search -> wait_for_search "
             "-> stop_search -> use_best_as_base -> repeat with new windows. "
+            "For section-by-section work, score each section with the "
+            "gate-entry target (honest gate crossings with heading, speed and "
+            "lateral limits, ordered waypoints, soft scoring for targets "
+            "nothing reaches yet; get_documentation gates), and use simulate "
+            "batches with gates and snapshots to build seeds quickly. "
             "Optimise section by section from the start, keep windows short "
             "(1-5 s) and use the GPU backend when available for throughput. "
             "Every action is visible in the user's GUI.");
